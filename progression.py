@@ -1,90 +1,36 @@
-
-import json
-import os
-from pathlib import Path
-
+from persistence import data_directory, read_json, write_json, log
+from state import bounded
 
 class Progression:
-    def __init__(self):
-        folder = Path(
-            os.getenv("LOCALAPPDATA") or Path.home()
-        ) / "DeskBug"
-
-        self.save_file = folder / "progress.json"
+    def __init__(self, save_file=None):
+        self.save_file = save_file or data_directory() / 'progress.json'
         self.level = 1
         self.xp = 0
-
         self.load()
 
     def required_xp(self):
         return 50 + (self.level - 1) * 25
 
     def stage(self):
-        if self.level >= 10:
-            return "Yetiskin"
-        if self.level >= 5:
-            return "Genc"
-        return "Yavru"
+        return 'Adult' if self.level >= 10 else 'Young spider' if self.level >= 5 else 'Spiderling'
 
     def add_xp(self, amount):
         if amount <= 0:
             return False
-
         self.xp += amount
-        leveled_up = False
-
+        leveled = False
         while self.xp >= self.required_xp():
             self.xp -= self.required_xp()
             self.level += 1
-            leveled_up = True
-
-            print(
-                f"WEBBY SEVIYE ATLADI! "
-                f"Yeni seviye: {self.level}"
-            )
-
+            leveled = True
+            log.info('Webby reached level %s', self.level)
         self.save()
-        return leveled_up
+        return leveled
 
     def save(self):
-        try:
-            self.save_file.parent.mkdir(
-                parents=True,
-                exist_ok=True
-            )
-
-            data = {
-                "level": self.level,
-                "xp": self.xp
-            }
-
-            temp = self.save_file.with_suffix(".tmp")
-            temp.write_text(
-                json.dumps(data, indent=4),
-                encoding="utf-8"
-            )
-            temp.replace(self.save_file)
-
-        except OSError as error:
-            print("XP kayit hatasi:", error)
+        write_json(self.save_file, {'level': self.level, 'xp': self.xp})
 
     def load(self):
-        if not self.save_file.exists():
-            return
-
-        try:
-            data = json.loads(
-                self.save_file.read_text(
-                    encoding="utf-8"
-                )
-            )
-
-            self.level = max(
-                1, int(data.get("level", 1))
-            )
-            self.xp = max(
-                0, int(data.get("xp", 0))
-            )
-
-        except (OSError, ValueError, TypeError) as error:
-            print("XP yuklenemedi:", error)
+        data = read_json(self.save_file)
+        self.level = bounded(data.get('level'), 1, 1, 1000000)
+        self.xp = bounded(data.get('xp'), 0, 0, 1000000000)

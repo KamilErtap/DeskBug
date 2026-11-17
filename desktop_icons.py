@@ -3,6 +3,7 @@ import ctypes
 from ctypes import wintypes
 
 from pywinauto import Desktop
+from persistence import log
 
 
 class POINT(ctypes.Structure):
@@ -42,7 +43,7 @@ def get_desktop_icons():
                 for icon_list in lists:
                     count = icon_list.item_count()
 
-                    print(f"Ikon listesi: {count} oge")
+                    log.debug("Desktop list contains %s icons", count)
 
                     for index in range(count):
                         try:
@@ -72,10 +73,7 @@ def get_desktop_icons():
                             )
 
                             if not success:
-                                print(
-                                    "Koordinat cevrilemedi:",
-                                    name
-                                )
+                                log.warning("ClientToScreen failed for desktop icon")
                                 continue
 
                             icons.append({
@@ -85,13 +83,10 @@ def get_desktop_icons():
                             })
 
                         except Exception as error:
-                            print(
-                                f"Ikon {index} hatasi:",
-                                error
-                            )
+                            log.warning("Unable to inspect icon %s", index, exc_info=True)
 
         except Exception as error:
-            print("Pencere hatasi:", error)
+            log.warning("Unable to inspect desktop window", exc_info=True)
 
     return icons
 

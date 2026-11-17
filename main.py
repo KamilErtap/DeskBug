@@ -4,9 +4,6 @@ import math
 import random
 import signal
 import ctypes
-import json
-from pathlib import Path
-import os
 
 from PySide6.QtWidgets import QApplication, QWidget
 from PySide6.QtCore import Qt, QTimer
@@ -15,9 +12,12 @@ from PySide6.QtGui import QPainter, QColor, QPen, QCursor
 from desktop_icons import get_desktop_icons
 from pet_panel import setup_pet_tray
 from progression import Progression
+from persistence import data_directory, read_json, write_json, configure_logging, close_logging, log
+from state import Settings, PetState
+from behavior import turn_towards, step_towards
+from webs import connect_web
+from graphics import draw_webs, draw_home, draw_spider
 
-
-DEBUG_TARGETS = False
 
 
 class Spider(QWidget):
@@ -47,6 +47,9 @@ class Spider(QWidget):
         self.target_x = self.x
         self.target_y = self.y
 
+        self.settings = Settings.load()
+        self.state = PetState.load()
+        self.heading = -90.0
         self.speed = 2.2
         self.animation = 0
 
@@ -69,6 +72,7 @@ class Spider(QWidget):
 
         self.home_icon = None
         self.sleeping = False
+        self.sleep_requested = False
         self.sleep_frames = 0
 
         # Kayitli yuvayi yukle
@@ -83,75 +87,52 @@ class Spider(QWidget):
 
     
     def load_home(self):
-        save_folder = Path(
-            os.getenv("LOCALAPPDATA") or Path.home()
-        ) / "DeskBug"
+        self.home_file = data_directory() / "home.json"
+        self.home_name = read_json(self.home_file).get("home_name")
+        self.home_icon = next((icon for icon in self.desktop_icons if icon['name'] == self.home_name), None)
+        if self.home_name is None and self.desktop_icons:
+            self.home_icon = random.choice(self.desktop_icons)
+            self.home_name = self.home_icon['name']
+            write_json(self.home_file, {'home_name': self.home_name})
 
-        self.home_file = save_folder / "home.json"
+    def refresh_environment(self):
+        screen = QApplication.primaryScreen()
+        self.setGeometry(screen.availableGeometry())
+        self.x = max(20, min(self.width()-20, self.x))
+        self.y = max(20, min(self.height()-20, self.y))
+        old_target = self.current_icon['name'] if self.current_icon else None
+        old_anchor = self.last_anchor['name'] if self.last_anchor else None
+        self.load_icons()
+        self.load_home()
+        icons = {icon['name']: icon for icon in self.desktop_icons}
+        self.web_edges = [dict(edge, start=icons[edge['start']['name']], end=icons[edge['end']['name']])
+                          for edge in self.web_edges
+                          if edge['start']['name'] in icons and edge['end']['name'] in icons]
+        self.last_anchor = icons.get(old_anchor)
+        self.current_icon = icons.get(old_target)
+        if self.current_icon:
+            self.target_x, self.target_y = self.current_icon['x'], self.current_icon['y']
+        else:
+            self.choose_target()
 
-        saved_name = None
+    def apply_settings(self):
+        self.settings.save()
+        self.setVisible(self.settings.pet_visible)
+        self.update()
 
-        # Daha once secilen yuvayi oku
-        if self.home_file.exists():
-            try:
-                data = json.loads(
-                    self.home_file.read_text(
-                        encoding="utf-8"
-                    )
-                )
-                saved_name = data.get("home_name")
-            except (OSError, ValueError) as error:
-                print("Yuva kaydi okunamadi:", error)
-
-        # Kayitli ikonu bul
-        self.home_icon = None
-
-        if saved_name is not None:
-            for icon in self.desktop_icons:
-                if icon["name"] == saved_name:
-                    self.home_icon = icon
-                    break
-
-        # Kayitli yuva yoksa yeni bir tane sec
-        if self.home_icon is None and self.desktop_icons:
-            self.home_icon = random.choice(
-                self.desktop_icons
-            )
-
-        # Secimi kaydet
-        if self.home_icon is not None:
-            try:
-                save_folder.mkdir(
-                    parents=True,
-                    exist_ok=True
-                )
-
-                self.home_file.write_text(
-                    json.dumps(
-                        {
-                            "home_name":
-                                self.home_icon["name"]
-                        },
-                        indent=4,
-                        ensure_ascii=False
-                    ),
-                    encoding="utf-8"
-                )
-
-                print(
-                    "Webby'nin yuvasi:",
-                    self.home_icon["name"]
-                )
-
-            except OSError as error:
-                print("Yuva kaydedilemedi:", error)
-
+    def request_sleep(self):
+        self.sleep_requested = True
+        self.rest_frames = 0
+        if self.home_icon is None:
+            self.sleeping = True
+        self.pet_panel.message.setText("Returning to the nest for a little rest." if self.home_icon else "Resting here until a nest is available.")
+        self.pet_panel.update_bars()
 
     def load_icons(self):
         try:
             raw_icons = get_desktop_icons()
         except Exception as error:
-            print("Ikon okuma hatasi:", error)
+            log.exception("Desktop icon scan failed")
             raw_icons = []
 
         self.desktop_icons = []
@@ -170,9 +151,7 @@ class Spider(QWidget):
                     "y": y
                 })
 
-        print(
-            f"{len(self.desktop_icons)} ikon bulundu."
-        )
+        log.debug("Found %s icons", len(self.desktop_icons))
 
     def choose_target(self):
         if self.desktop_icons:
@@ -189,7 +168,7 @@ class Spider(QWidget):
             self.target_x = self.current_icon["x"]
             self.target_y = self.current_icon["y"]
 
-            print("Yeni hedef:", self.current_icon["name"])
+            log.debug("%s", " ".join(str(value) for value in ("Yeni hedef:", self.current_icon["name"],)))
 
         else:
             self.current_icon = None
@@ -205,106 +184,32 @@ class Spider(QWidget):
                 max(margin, self.height() - margin)
             )
 
-    def connect_web(self, icon):
-        # Ilk ikon agin baslangic noktasi
-        if self.last_anchor is None:
-            self.last_anchor = icon
-            print("Ilk ag noktasi:", icon["name"])
-            return
+    connect_web = connect_web
 
-        if self.last_anchor is icon:
-            return
-
-        start = self.last_anchor
-        end = icon
-
-        # Ayni iki ikon arasina tekrar ag kurma
-        edge_key = frozenset(
-            (id(start), id(end))
-        )
-
-        for edge in self.web_edges:
-            if edge["key"] == edge_key:
-                self.last_anchor = icon
-                return
-
-        self.web_edges.append({
-            "start": start,
-            "end": end,
-            "key": edge_key
-        })
-
-        if len(self.web_edges) > self.max_web_edges:
-            self.web_edges.pop(0)
-
-        print(
-            "AG ORULDU:",
-            start["name"],
-            "->",
-            end["name"]
-        )
-
-        self.last_anchor = icon
-
-        # Yeni ag baglantisi = 10 XP
-        leveled_up = self.progression.add_xp(10)
-
-        print(
-            f"XP: {self.progression.xp}/"
-            f"{self.progression.required_xp()} | "
-            f"Seviye: {self.progression.level}"
-        )
-
-        if leveled_up and hasattr(self, "pet_panel"):
-            self.pet_panel.message.setText(
-                f"Webby seviye {self.progression.level} oldu!"
-            )
-
-    
     def get_pet_stats(self):
-        # Panel bagli degilse varsayilan degerler
-        if not hasattr(self, "pet_panel"):
-            return 85, 75, 90
+        return self.state.food, self.state.energy, self.state.happiness
 
-        return (
-            self.pet_panel.food,
-            self.pet_panel.energy,
-            self.pet_panel.happiness
-        )
-
-    
     def update_sleep(self):
         if not self.sleeping:
             return False
 
-        self.sleep_frames += 1
+        self.sleep_frames += self.frame_scale
 
         # Yaklasik 3 saniyede bir enerji kazan
         if self.sleep_frames >= 100:
             self.sleep_frames = 0
 
-            if hasattr(self, "pet_panel"):
-                panel = self.pet_panel
-
-                panel.energy = min(
-                    100, panel.energy + 5
-                )
-
-                panel.update_bars()
-
-                panel.message.setText(
-                    "Webby yuvasinda uyuyor..."
-                )
-
-                # Enerjisi dolunca uyan
-                if panel.energy >= 60:
-                    self.sleeping = False
-
-                    panel.message.setText(
-                        "Webby uyandi!"
-                    )
-
-                    self.choose_target()
+            self.state.energy = min(100, self.state.energy + 5)
+            self.state.save()
+            if hasattr(self, 'pet_panel'):
+                self.pet_panel.update_bars()
+                self.pet_panel.message.setText("Webby is sleeping peacefully…")
+            if self.state.energy >= 60:
+                self.sleeping = False
+                self.sleep_requested = False
+                if hasattr(self, 'pet_panel'):
+                    self.pet_panel.message.setText("Rested and ready to explore.")
+                self.choose_target()
 
         self.update()
         return True
@@ -312,6 +217,10 @@ class Spider(QWidget):
 
 
     def update_spider(self):
+        interval = 120 if self.sleeping or self.rest_frames > 0 or not self.settings.pet_visible else 30
+        self.timer.setInterval(interval)
+        self.frame_scale = interval / 30
+        motion_scale = self.frame_scale * self.settings.animation_speed / 100
 
 
         # Webby uyuyorsa hareket etmesin
@@ -321,7 +230,12 @@ class Spider(QWidget):
         # Enerji azsa yuvasina donsun
         food, energy, happiness = self.get_pet_stats()
 
-        if energy <= 20 and self.home_icon is not None:
+        if (energy <= 20 or self.sleep_requested) and self.home_icon is None:
+            self.sleeping = True
+            self.sleep_frames = 0
+            return
+
+        if (energy <= 20 or self.sleep_requested) and self.home_icon is not None:
             self.current_icon = self.home_icon
             self.target_x = self.home_icon["x"]
             self.target_y = self.home_icon["y"]
@@ -342,7 +256,7 @@ class Spider(QWidget):
 
                 if hasattr(self, "pet_panel"):
                     self.pet_panel.message.setText(
-                        "Webby yuvasinda uykuya daldi!"
+                        "Tucked into the nest. Sweet dreams, Webby."
                     )
 
                 self.update()
@@ -364,7 +278,7 @@ class Spider(QWidget):
             self.rest_frames = 0
 
         if self.scared_frames > 0:
-            self.scared_frames -= 1
+            self.scared_frames = max(0, self.scared_frames - self.frame_scale)
 
             # Fareden uzaklasma yonu
             if mouse_distance > 0.01:
@@ -375,20 +289,21 @@ class Spider(QWidget):
 
             self.x = max(
                 20,
-                min(self.width() - 20, self.x + vx * 5)
+                min(self.width() - 20, self.x + vx * 5 * motion_scale)
             )
 
             self.y = max(
                 20,
-                min(self.height() - 20, self.y + vy * 5)
+                min(self.height() - 20, self.y + vy * 5 * motion_scale)
             )
 
-            self.animation += 0.3
+            self.heading = turn_towards(self.heading, math.degrees(math.atan2(vy, vx)))
+            self.animation += 0.3 * motion_scale
             self.update()
             return
 
         if self.rest_frames > 0:
-            self.rest_frames -= 1
+            self.rest_frames = max(0, self.rest_frames - self.frame_scale)
             self.update()
             return
 
@@ -433,204 +348,16 @@ class Spider(QWidget):
             # Tamamen hareketsiz kalmasin
             current_speed = max(0.45, current_speed)
 
-            step = min(current_speed, distance)
-
-            self.x += dx / distance * step
-            self.y += dy / distance * step
-
-            self.animation += 0.22
+            self.heading = turn_towards(self.heading, math.degrees(math.atan2(dy, dx)))
+            self.x, self.y = step_towards(self.x, self.y, self.target_x, self.target_y, current_speed * motion_scale)
+            self.animation += 0.22 * motion_scale
 
 
         self.update()
 
-    def draw_webs(self, painter):
-        painter.save()
-
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-
-        # Tamamlanmis ag baglantilari
-        painter.setPen(
-            QPen(QColor(160, 205, 240, 170), 1.5)
-        )
-
-        for edge in self.web_edges:
-            start = edge["start"]
-            end = edge["end"]
-
-            painter.drawLine(
-                int(start["x"]),
-                int(start["y"]),
-                int(end["x"]),
-                int(end["y"])
-            )
-
-        # Orumcek yururken iplik cekiyor
-        if (
-            self.last_anchor is not None
-            and self.current_icon is not None
-            and self.last_anchor is not self.current_icon
-            and self.scared_frames == 0
-        ):
-            painter.setPen(
-                QPen(QColor(190, 220, 255, 130), 1)
-            )
-
-            painter.drawLine(
-                int(self.last_anchor["x"]),
-                int(self.last_anchor["y"]),
-                int(self.x),
-                int(self.y)
-            )
-
-        painter.restore()
-
-    def draw_targets(self, painter):
-        if not DEBUG_TARGETS:
-            return
-
-        painter.save()
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(0, 220, 100, 130))
-
-        for icon in self.desktop_icons:
-            painter.drawEllipse(
-                int(icon["x"]) - 5,
-                int(icon["y"]) - 5,
-                10, 10
-            )
-
-        painter.restore()
-
-    
-    def draw_home(self, painter):
-        if self.home_icon is None:
-            return
-
-        painter.save()
-
-        x = self.home_icon["x"]
-        y = self.home_icon["y"]
-
-        painter.translate(x, y)
-
-        # Kozanin dis halkasi
-        painter.setPen(
-            QPen(QColor(183, 156, 255, 120), 1.5)
-        )
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-
-        painter.drawEllipse(-30, -25, 60, 50)
-        painter.drawEllipse(-24, -20, 48, 40)
-
-        # Ipek iplikleri
-        painter.setPen(
-            QPen(QColor(190, 205, 255, 100), 1)
-        )
-
-        for i in range(8):
-            angle = (2 * math.pi * i) / 8
-
-            outer_x = math.cos(angle) * 30
-            outer_y = math.sin(angle) * 25
-
-            painter.drawLine(
-                0, 0,
-                int(outer_x),
-                int(outer_y)
-            )
-
-        # Uyurken koza hafif parlar
-        if self.sleeping:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(
-                QColor(160, 120, 255, 40)
-            )
-            painter.drawEllipse(-23, -19, 46, 38)
-
-        painter.restore()
-
-
-    def draw_spider(self, painter):
-        painter.save()
-
-
-        if self.sleeping:
-            painter.setPen(
-                QPen(QColor("#B79CFF"), 2)
-            )
-
-            painter.drawText(
-                int(self.x + 17),
-                int(self.y - 25),
-                "Zzz"
-            )
-
-
-        bob = math.sin(self.animation) * 2
-        painter.translate(self.x, self.y + bob)
-
-
-        # Seviyeye gore fiziksel buyume
-        level = self.progression.level
-
-        if level < 5:
-            # Yavru
-            size = 0.85 + (level - 1) * 0.05
-
-        elif level < 10:
-            # Genc
-            size = 1.10 + (level - 5) * 0.07
-
-        else:
-            # Yetiskin
-            size = 1.50 + min(level - 10, 10) * 0.04
-
-        painter.scale(size, size)
-
-
-        angle = math.degrees(
-            math.atan2(
-                self.target_y - self.y,
-                self.target_x - self.x
-            )
-        )
-
-        painter.rotate(angle)
-
-        color = QColor("#292929")
-
-        if self.scared_frames > 0:
-            color = QColor("#7B3FE4")
-
-        painter.setPen(QPen(color, 3))
-
-        # Sekiz hareketli bacak
-        for side in (-1, 1):
-            for i in range(4):
-                wave = math.sin(
-                    self.animation + i * 1.5
-                ) * 4
-
-                painter.drawLine(
-                    side * 7,
-                    i * 2 - 3,
-                    int(side * (20 + i * 3)),
-                    int((i - 1) * 6 + wave)
-                )
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(color)
-        painter.drawEllipse(-13, -12, 26, 24)
-
-        painter.setBrush(QColor("white"))
-        painter.drawEllipse(-7, -5, 5, 5)
-        painter.drawEllipse(2, -5, 5, 5)
-
-        painter.setBrush(QColor("black"))
-        painter.drawEllipse(-5, -4, 2, 2)
-        painter.drawEllipse(4, -4, 2, 2)
-
-        painter.restore()
+    draw_webs = draw_webs
+    draw_home = draw_home
+    draw_spider = draw_spider
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -640,55 +367,69 @@ class Spider(QWidget):
         )
 
         self.draw_webs(painter)
-        self.draw_targets(painter)
         self.draw_home(painter)
         self.draw_spider(painter)
 
         painter.end()
 
 
-signal.signal(
-    signal.SIGINT,
-    signal.default_int_handler
-)
+def main():
+    configure_logging()
+    # Qt 6 enables per-monitor high-DPI support before creating native windows.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    app = QApplication(sys.argv)
+    app.setApplicationName("DeskBug")
+    app.setQuitOnLastWindowClosed(False)
+    spider = Spider()
+    pet_panel, tray = setup_pet_tray(app, spider)
+    spider.pet_panel = pet_panel
+    pet_panel.set_progression(spider.progression)
+    spider.apply_settings()
 
-app = QApplication(sys.argv)
+    refresh_timer = QTimer(spider)
+    refresh_timer.timeout.connect(spider.refresh_environment)
+    refresh_timer.start(60000)
+    def watch_screen(screen):
+        screen.availableGeometryChanged.connect(lambda *_: spider.refresh_environment())
+        screen.logicalDotsPerInchChanged.connect(lambda *_: spider.refresh_environment())
+    def screen_added(screen):
+        watch_screen(screen)
+        spider.refresh_environment()
+    app.screenAdded.connect(screen_added)
+    app.screenRemoved.connect(lambda *_: spider.refresh_environment())
+    app.primaryScreenChanged.connect(lambda *_: spider.refresh_environment())
+    for screen in app.screens():
+        watch_screen(screen)
 
-# Panel kapaninca ana uygulama kapanmasin
-app.setQuitOnLastWindowClosed(False)
+    shortcut_timer = QTimer(spider)
+    def check_exit_shortcut():
+        if sys.platform == 'win32':
+            user32 = ctypes.windll.user32
+            if all(user32.GetAsyncKeyState(key) & 0x8000 for key in (0x11,0x12,0x51)):
+                app.quit()
+    shortcut_timer.timeout.connect(check_exit_shortcut)
+    shortcut_timer.start(100)
 
-spider = Spider()
-spider.show()
-
-# Pet paneli ve sistem tepsisi
-pet_panel, tray = setup_pet_tray(app)
-
-# Orumcek pet degerlerini okuyabilsin
-spider.pet_panel = pet_panel
-pet_panel.set_progression(spider.progression)
-
-signal_timer = QTimer()
-signal_timer.timeout.connect(lambda: None)
-signal_timer.start(100)
-
-user32 = ctypes.windll.user32
-
-
-def check_exit_shortcut():
-    ctrl = user32.GetAsyncKeyState(0x11) & 0x8000
-    alt = user32.GetAsyncKeyState(0x12) & 0x8000
-    q = user32.GetAsyncKeyState(0x51) & 0x8000
-
-    if ctrl and alt and q:
+    def shutdown():
+        spider.timer.stop()
+        refresh_timer.stop()
+        shortcut_timer.stop()
+        pet_panel.needs_timer.stop()
+        pet_panel.xp_timer.stop()
+        spider.state.save()
+        spider.progression.save()
+        spider.settings.save()
+        tray.hide()
+        spider.close()
+        log.info("DeskBug shut down cleanly")
+        close_logging()
+    app.aboutToQuit.connect(shutdown)
+    log.info("DeskBug started")
+    try:
+        return app.exec()
+    except KeyboardInterrupt:
         app.quit()
+        return 0
 
-
-shortcut_timer = QTimer()
-shortcut_timer.timeout.connect(check_exit_shortcut)
-shortcut_timer.start(50)
-
-try:
-    sys.exit(app.exec())
-except KeyboardInterrupt:
-    app.quit()
-    sys.exit(0)
+if __name__ == '__main__':
+    sys.exit(main())
